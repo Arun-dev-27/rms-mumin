@@ -35,6 +35,12 @@ export type HandoffResult =
   | { ok: true; claims: Record<string, unknown>; kid: string | undefined; denied: boolean }
   | { ok: false; code: string };
 
+/** A handoff the user asked for before signing in to this (source) app. */
+export interface PendingHandoff {
+  targetClientId: string;
+  path: string;
+}
+
 const AAL2 = 'urn:miqaat:aal:2';
 
 @Injectable()
@@ -43,7 +49,8 @@ export class BuService {
   /** Every localhost port shares one cookie jar, so the cookie name carries the app key. */
   private readonly cookieName = `${config.appKey.replace(/-/g, '_')}_browser`;
   private readonly browsers = new Map<string, BrowserState>();
-  private readonly pendingLogin = new Map<string, { browserId: string; verifier: string; nonce: string; acr: string; at: number }>();
+  /** Sign-ins in progress; `then` = a handoff to continue once signed in. */
+  private readonly pendingLogin = new Map<string, { browserId: string; verifier: string; nonce: string; acr: string; at: number; then?: PendingHandoff }>();
   private readonly pendingLogout = new Map<string, { browserId: string; at: number }>();
   /** Back-channel logout jti values already processed (replay protection). */
   private readonly seenLogoutJti = new Map<string, number>();
@@ -109,14 +116,14 @@ export class BuService {
 
   // ---- sign in: Authorization Code + PKCE ---------------------------------------------------------
 
-  /** Returns the Core /auth URL the browser is sent to. */
-  startLogin(b: BrowserState, acr: string | undefined, maxAge: string | undefined): string {
+  /** Returns the Core /auth URL the browser is sent to. `then`: a handoff to continue after sign-in. */
+  startLogin(b: BrowserState, acr: string | undefined, maxAge: string | undefined, then?: PendingHandoff): string {
     this.basicAuth(); // fail early when the secret is missing
     const verifier = randomBytes(32).toString('base64url');
     const state = randomBytes(16).toString('base64url');
     const nonce = randomBytes(16).toString('base64url');
     const acrValue = acr === 'aal2' ? AAL2 : '';
-    this.pendingLogin.set(state, { browserId: b.id, verifier, nonce, acr: acrValue, at: Date.now() });
+    this.pendingLogin.set(state, { browserId: b.id, verifier, nonce, acr: acrValue, at: Date.now(), then });
     const q = new URLSearchParams({
       response_type: 'code',
       client_id: config.clientId,
@@ -132,11 +139,16 @@ export class BuService {
     return `${config.issuer}/auth?${q}`;
   }
 
-  async finishLogin(b: BrowserState, query: Record<string, string | undefined>): Promise<void> {
+  /** Completes the sign-in; returns where to send the browser next (home, or the handoff it was started for). */
+  async finishLogin(b: BrowserState, query: Record<string, string | undefined>): Promise<string> {
     const flow = this.pendingLogin.get(query.state ?? '');
     this.pendingLogin.delete(query.state ?? '');
-    if (query.error) return this.fail(b, `${query.error}: ${query.error_description ?? ''}`);
-    if (!flow || flow.browserId !== b.id) return this.fail(b, 'unknown or reused state');
+    const failed = (message: string) => {
+      this.fail(b, message);
+      return '/';
+    };
+    if (query.error) return failed(`${query.error}: ${query.error_description ?? ''}`);
+    if (!flow || flow.browserId !== b.id) return failed('unknown or reused state');
 
     const tokenRes = await fetch(`${config.issuer}/token`, {
       method: 'POST',
@@ -149,15 +161,18 @@ export class BuService {
       }),
     });
     const tokens = (await tokenRes.json()) as { id_token?: string; access_token?: string; error?: string; error_description?: string };
-    if (!tokens.id_token) return this.fail(b, `/token: ${tokens.error} ${tokens.error_description ?? ''}`);
+    if (!tokens.id_token) return failed(`/token: ${tokens.error} ${tokens.error_description ?? ''}`);
 
     const { payload } = await jwtVerify(tokens.id_token, this.jwks, { issuer: config.issuer, audience: config.clientId, algorithms: ['RS256'] });
-    if (payload.nonce !== flow.nonce) return this.fail(b, 'nonce mismatch');
+    if (payload.nonce !== flow.nonce) return failed('nonce mismatch');
     const me = await fetch(`${config.issuer}/me`, { headers: { authorization: `Bearer ${tokens.access_token}` } }).then((r) => r.json());
 
     b.session = { claims: payload as Record<string, unknown>, me, kid: decodeProtectedHeader(tokens.id_token).kid, at: new Date().toISOString(), idToken: tokens.id_token };
     b.lastError = flow.acr && payload.acr !== flow.acr ? `asked for ${flow.acr}, got ${String(payload.acr)}` : null;
     this.event(b, `Signed in: ID token verified with JWKS (kid ${b.session.kid}), ${String(payload.acr)}`);
+    if (!flow.then) return '/';
+    // Signed in because a handoff was asked for: continue it now that the source has a local session.
+    return `/handoff?${new URLSearchParams({ target: flow.then.targetClientId, path: flow.then.path })}`;
   }
 
   // ---- logout -------------------------------------------------------------------------------------
@@ -234,17 +249,21 @@ export class BuService {
 
   // ---- trusted handoff ------------------------------------------------------------------------------
 
-  /** SOURCE side: ask Core for a handoff as this app (never sends the ITS ID). Returns the Core URL, or null. */
+  /**
+   * SOURCE side: ask Core for a handoff as this app (never sends the ITS ID). Returns the Core URL to send the
+   * browser to, or null. Without a local session the source signs the user in first (Core /auth) and continues
+   * the same handoff from the callback.
+   */
   async startHandoff(b: BrowserState, targetClientId: string | undefined, path: string | undefined): Promise<string | null> {
     const target = config.peers.find((p) => p.clientId === targetClientId);
-    const requestedPath = path || '/dashboard';
-    if (!b.session) {
-      this.event(b, 'Handoff refused: sign in to this app first (source must have a local session)', false);
-      return null;
-    }
+    const requestedPath = (path || '/dashboard').slice(0, 512);
     if (!target) {
       this.event(b, `Handoff refused: unknown target ${targetClientId ?? ''}`, false);
       return null;
+    }
+    if (!b.session) {
+      this.event(b, `Handoff to ${target.label} ${requestedPath}: no local session - signing in first, the handoff continues after sign-in`);
+      return this.startLogin(b, undefined, undefined, { targetClientId: target.clientId, path: requestedPath });
     }
     const r = await fetch(`${config.issuer}/v1/handoff/requests`, {
       method: 'POST',

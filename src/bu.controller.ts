@@ -40,8 +40,11 @@ export class BuController {
   @Get('auth/callback')
   async callback(@Req() req: Request, @Res() res: Response, @Query() query: Record<string, string | undefined>) {
     const b = this.bu.browser(req, res);
-    await this.bu.finishLogin(b, query).catch((error: unknown) => this.bu.fail(b, error instanceof Error ? error.message : String(error)));
-    res.redirect(303, '/');
+    const next = await this.bu.finishLogin(b, query).catch((error: unknown) => {
+      this.bu.fail(b, error instanceof Error ? error.message : String(error));
+      return '/';
+    });
+    res.redirect(303, next);
   }
 
   // ---- logout -----------------------------------------------------------------------------------
